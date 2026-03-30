@@ -13,6 +13,7 @@ from pipeline import (
     CSVInput,
     JSONInput,
     JSONOutput,
+    MongoDBInput,
     Normalizer,
     OpenAIProvider,
     Pipeline,
@@ -56,7 +57,8 @@ async def process_existing_batches(
 ):
     """Process existing batch IDs with enhanced monitoring and error handling"""
     logger.info(f"Processing {len(batch_ids)} existing batch IDs")
-    logger.info(f"Will check for completion every {check_interval_minutes} minutes")
+    logger.info(
+        f"Will check for completion every {check_interval_minutes} minutes")
 
     # Initialize OpenAI provider
     config = Config()
@@ -73,7 +75,8 @@ async def process_existing_batches(
     progress_callback = monitor.create_progress_logger(log_to_file=True)
 
     # Wait for batch completion with monitoring
-    logger.info("Starting batch monitoring - you can safely leave this running in tmux")
+    logger.info(
+        "Starting batch monitoring - you can safely leave this running in tmux")
     batch_results = await monitor.wait_for_completion_with_monitoring(
         batch_ids, progress_callback
     )
@@ -141,6 +144,10 @@ async def main(
     session_id: str = None,
     resume_from_checkpoint: bool = False,
     list_sessions: bool = False,
+    # MongoDB options
+    mongo_uri: str = None,
+    mongo_db: str = None,
+    mongo_collection: str = None,
 ):
     logger.debug("Starting pipeline processing...")
 
@@ -155,7 +162,8 @@ async def main(
                 if info:
                     print(f"Session: {session}")
                     print(f"  Timestamp: {info.get('timestamp', 'Unknown')}")
-                    print(f"  Processed: {info.get('processed_count', 0)} items")
+                    print(
+                        f"  Processed: {info.get('processed_count', 0)} items")
                     print(f"  Batches: {info.get('batch_count', 0)}")
                     print(f"  Results: {info.get('total_results', 0)}")
                     if info.get("additional_state", {}).get("emergency_save"):
@@ -176,35 +184,59 @@ async def main(
         )
         return
 
-    # For normal processing, we need dataset_path and dataset_name
-    if not dataset_path or not dataset_name:
-        raise ValueError("Dataset path and name are required for normal processing")
+    # Determine the input source: MongoDB takes priority over file-based inputs
+    using_mongo = mongo_uri and mongo_db and mongo_collection
+
+    # For normal processing, we need either MongoDB args or dataset_path + dataset_name
+    if not using_mongo and (not dataset_path or not dataset_name):
+        raise ValueError(
+            "Provide either --mongo_uri/--mongo_db/--mongo_collection "
+            "or --dataset_path and --dataset_name"
+        )
 
     # Load configurations
     config = Config()
     template_handler = TemplateHandler()
     topics = template_handler.load_topics("edam_topics.txt")
 
-    column_mappings = ColumnMappingsConfig()
-    dataset_config = column_mappings.get_dataset_config(dataset_name)
-
-    # Initialize components
-    if dataset_path.lower().endswith(".csv"):
-        input_handler = CSVInput(
-            filepath=dataset_path,
+    # Initialize input handler
+    if using_mongo:
+        # Use the 'nde' column mapping as a sensible default; override via dataset_name
+        effective_dataset_name = dataset_name or "nde"
+        column_mappings = ColumnMappingsConfig()
+        dataset_config = column_mappings.get_dataset_config(
+            effective_dataset_name)
+        input_handler = MongoDBInput(
+            uri=mongo_uri,
+            database=mongo_db,
+            collection=mongo_collection,
             text_columns=dataset_config["text_columns"],
             metadata_mapping=dataset_config["metadata_mapping"],
-            id_column=dataset_config.get("id_column"),
+            id_field=dataset_config.get("id_column", "_id"),
         )
-    elif dataset_path.lower().endswith(".json"):
-        input_handler = JSONInput(
-            filepath=dataset_path,
-            text_columns=dataset_config["text_columns"],
-            metadata_mapping=dataset_config["metadata_mapping"],
-            id_column=dataset_config.get("id_column"),
-        )
+        if dataset_name is None:
+            dataset_name = effective_dataset_name
     else:
-        raise ValueError("Unsupported file format. Please provide a CSV or JSON file.")
+        column_mappings = ColumnMappingsConfig()
+        dataset_config = column_mappings.get_dataset_config(dataset_name)
+
+        if dataset_path.lower().endswith(".csv"):
+            input_handler = CSVInput(
+                filepath=dataset_path,
+                text_columns=dataset_config["text_columns"],
+                metadata_mapping=dataset_config["metadata_mapping"],
+                id_column=dataset_config.get("id_column"),
+            )
+        elif dataset_path.lower().endswith(".json"):
+            input_handler = JSONInput(
+                filepath=dataset_path,
+                text_columns=dataset_config["text_columns"],
+                metadata_mapping=dataset_config["metadata_mapping"],
+                id_column=dataset_config.get("id_column"),
+            )
+        else:
+            raise ValueError(
+                "Unsupported file format. Please provide a CSV or JSON file.")
 
     # Initialize OpenAI provider
     llm_provider = OpenAIProvider(
@@ -232,12 +264,14 @@ async def main(
     ]
 
     postprocessors = [
-        Normalizer(data_path="edam/EDAM.csv", edam_topics_path="edam/edam_topics.txt")
+        Normalizer(data_path="edam/EDAM.csv",
+                   edam_topics_path="edam/edam_topics.txt")
     ]
 
     # Initialize output handler with custom filename if provided
     output_filename = output_filename or f"{dataset_name}_results.json"
-    output_handler = JSONOutput(output_dir=Path("results"), filename=output_filename)
+    output_handler = JSONOutput(output_dir=Path(
+        "results"), filename=output_filename)
 
     # Create and run pipeline
     pipeline = Pipeline(
@@ -268,14 +302,32 @@ async def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the data processing pipeline")
+    parser = argparse.ArgumentParser(
+        description="Run the data processing pipeline")
 
     # Create a group for normal processing
     normal_group = parser.add_argument_group("Normal Processing")
-    normal_group.add_argument("--dataset_path", help="Path to the dataset file")
+    normal_group.add_argument(
+        "--dataset_path", help="Path to the dataset file")
     normal_group.add_argument(
         "--dataset_name",
         help="Name of the dataset configuration matched to column mappings",
+    )
+
+    # MongoDB source options
+    mongo_group = parser.add_argument_group(
+        "MongoDB Source (alternative to --dataset_path)")
+    mongo_group.add_argument(
+        "--mongo_uri",
+        help="MongoDB connection URI, e.g. mongodb://su11:27017",
+    )
+    mongo_group.add_argument(
+        "--mongo_db",
+        help="MongoDB database name",
+    )
+    mongo_group.add_argument(
+        "--mongo_collection",
+        help="MongoDB collection name",
     )
     normal_group.add_argument(
         "--mode",
@@ -337,7 +389,8 @@ if __name__ == "__main__":
     )
 
     # Add output file name argument
-    parser.add_argument("--output", help="Custom output file name (without extension)")
+    parser.add_argument(
+        "--output", help="Custom output file name (without extension)")
 
     args = parser.parse_args()
 
@@ -348,7 +401,9 @@ if __name__ == "__main__":
 
     # Determine which mode to run in
     batch_mode = args.batch_ids is not None or args.batch_file is not None
-    normal_mode = args.dataset_path is not None and args.dataset_name is not None
+    mongo_mode = args.mongo_uri is not None and args.mongo_db is not None and args.mongo_collection is not None
+    normal_mode = (
+        args.dataset_path is not None and args.dataset_name is not None) or mongo_mode
 
     if batch_mode and normal_mode:
         print(
@@ -385,11 +440,12 @@ if __name__ == "__main__":
         )
     elif normal_mode:
         # Normal pipeline processing
-        # Use custom output name if provided
+        default_name = args.dataset_name or (
+            args.mongo_collection if mongo_mode else "output")
         output_filename = (
             f"{args.output}_results.json"
             if args.output
-            else f"{args.dataset_name}_results.json"
+            else f"{default_name}_results.json"
         )
         asyncio.run(
             main(
@@ -401,6 +457,9 @@ if __name__ == "__main__":
                 checkpoint_interval=args.checkpoint_interval,
                 session_id=args.session_id,
                 resume_from_checkpoint=args.resume,
+                mongo_uri=args.mongo_uri,
+                mongo_db=args.mongo_db,
+                mongo_collection=args.mongo_collection,
             )
         )
     else:
@@ -453,4 +512,10 @@ if __name__ == "__main__":
         print("    --batch_ids batch_12345 --check_interval 5")
         print("\n  # List checkpoint sessions")
         print("  python nde_pipeline_topic_categories.py --list_sessions")
+        print("\n  # Process a MongoDB collection (sync)")
+        print("  python nde_pipeline_topic_categories.py \\")
+        print("    --mongo_uri mongodb://su11:27017 \\")
+        print("    --mongo_db nde_hub_src \\")
+        print("    --mongo_collection node \\")
+        print("    --mode sync")
         sys.exit(1)

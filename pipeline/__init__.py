@@ -2,6 +2,7 @@ from .core.data_model import BatchJob, CategoryResult, JobStatus, TextItem
 from .core.pipeline import Pipeline
 from .input.csv_input import CSVInput
 from .input.json_input import JSONInput
+from .input.mongodb_input import MongoDBInput
 from .llm.openai_provider import OpenAIProvider
 from .output.csv_output import CSVOutput
 from .output.json_output import JSONOutput
@@ -20,6 +21,7 @@ __all__ = [
     "Pipeline",
     "CSVInput",
     "JSONInput",
+    "MongoDBInput",
     "OpenAIProvider",
     "Config",
     "ColumnMappingsConfig",

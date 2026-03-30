@@ -18,6 +18,7 @@ dependencies = [
     "transformers",
     "torch",
     "bitsandbytes",
+    "pymongo",
 ]
 
 [project.optional-dependencies]
